@@ -14,6 +14,7 @@ class cudaDeviceAttrNames:
     """
 
     cudaDevAttrMaxThreadsPerBlock: int = 1
+    cudaDevAttrMaxSharedMemoryPerBlock: int = 8
     cudaDevAttrMaxRegistersPerBlock: int = 12
     cudaDevAttrMaxSharedMemoryPerMultiprocessor: int = 81
     cudaDevAttrMaxPersistingL2CacheSize: int = 108
@@ -41,7 +42,15 @@ def get_shared_memory_per_block(device_id: int = 0, format: str = "bytes") -> in
     prop = get_cuda_device_properties(device_id)
     if prop is None:
         raise RuntimeError("Failed to get device properties.")
-    shared_mem = int(prop.shared_memory_per_block)
+    shared_mem = None
+    for attr_name in ("shared_memory_per_block", "max_shared_memory_per_block"):
+        if hasattr(prop, attr_name):
+            shared_mem = int(getattr(prop, attr_name))
+            break
+    if shared_mem is None:
+        shared_mem = get_device_attribute(cudaDeviceAttrNames.cudaDevAttrMaxSharedMemoryPerBlock, device_id)
+    if shared_mem is None:
+        raise RuntimeError("Failed to get shared memory per block.")
     if format == "bytes":
         return shared_mem
     elif format == "kb":

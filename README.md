@@ -13,4 +13,3 @@ Near-memory computing and distributed memory systems have become key approaches 
 
 ## Latest News
 - 10/30/2025 📦:
-new branch
