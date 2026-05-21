@@ -48,7 +48,9 @@ def flashattn(batch, heads, seq_len, dim, groups=1, block_M=64, block_N=64, num_
             logsum = T.alloc_shared([block_M], accum_dtype)
 
             # Persistent loop
-            for bz, by, bx in T.Persistent(sharded_batch, sharded_heads, T.ceildiv(seq_len, block_M)):
+            for bz, by, bx in T.Persistent(
+                [sharded_batch, sharded_heads, T.ceildiv(seq_len, block_M)], ncores, _cid
+            ):
                 T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared)
                 T.fill(acc_o, 0)
                 T.fill(logsum, 0)
@@ -66,9 +68,9 @@ def flashattn(batch, heads, seq_len, dim, groups=1, block_M=64, block_N=64, num_
                     T.copy(scores_max, scores_max_prev)
                     T.fill(scores_max, -T.infinity(accum_dtype))
                     T.reduce_max(acc_s, scores_max, dim=1, clear=False)
-                    for i in T.Tiles(block_M):
+                    for i in T.Tiles([block_M]):
                         scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
-                    for i in T.Tiles(block_M):
+                    for i in T.Tiles([block_M]):
                         scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
                     for i, j in T.Tiles([block_M, block_N]):
                         acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
@@ -89,3 +91,34 @@ def flashattn(batch, heads, seq_len, dim, groups=1, block_M=64, block_N=64, num_
                 T.copy(O_shared, Output[bz, bx * block_M : (bx + 1) * block_M, by, :])
 
     return main
+
+
+if __name__ == "__main__":
+    pf = flashattn(
+        batch=1,
+        heads=16,
+        seq_len=512,
+        dim=128,
+        groups=16,
+        block_M=64,
+        block_N=64,
+        num_stages=0,
+    )
+
+    from tilelang.utils.target import determine_target
+    from tilelang import tvm
+    from pathlib import Path
+
+    open("/home/guanzhou/project/Tilelang/tmp/fa_tir.py", "w").write(pf.script())
+    target = determine_target("Sunmmio", return_object=True)
+
+    pf = pf.with_attr("global_symbol", "main")
+    pf = pf.with_attr("calling_conv", int(tvm.ir.CallingConv.DEVICE_KERNEL_LAUNCH))
+
+    mod = tvm.IRModule({"main": pf})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+
+    src = builder(mod, target).inspect_source()
+
+    Path("/home/guanzhou/project/Tilelang/tmp/fa_sunmmio_backend.mlir").write_text(src)
+    print(src)
