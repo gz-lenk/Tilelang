@@ -1,6 +1,7 @@
 /*!
  * \file validate_copy_tile_view.cc
- * \brief Validate copy regions that must be representable as Sunmmio tile views.
+ * \brief Validate copy regions that must be representable as Sunmmio tile
+ * views.
  */
 
 #include <tvm/arith/analyzer.h>
@@ -11,6 +12,9 @@
 #include <tvm/tir/transform.h>
 
 #include <string>
+#include <optional>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -31,7 +35,7 @@ using namespace tir::transform;
 namespace {
 
 class ValidateCopyTileViewPass : public StmtExprVisitor {
- public:
+public:
   static PrimFunc Run(PrimFunc f) {
     auto target = f->GetAttr<Target>(tvm::attr::kTarget);
     if (!target.defined() || !TargetIsSunmmio(target.value())) {
@@ -43,10 +47,8 @@ class ValidateCopyTileViewPass : public StmtExprVisitor {
     return f;
   }
 
- private:
+private:
   struct ScopeFrame {
-    LayoutMap layout_map;
-    LayoutMap global_layout_map;
     Map<Var, TileView> tileview_map;
   };
 
@@ -79,16 +81,6 @@ class ValidateCopyTileViewPass : public StmtExprVisitor {
       frame = scope_stack_.back();
     }
 
-    if (block->annotations.count(attr::kLayoutMap)) {
-      frame.layout_map = block->annotations.at(attr::kLayoutMap)
-                             .as<LayoutMap>()
-                             .value();
-    }
-    if (block->annotations.count(attr::kGlobalLayoutMap)) {
-      frame.global_layout_map = block->annotations.at(attr::kGlobalLayoutMap)
-                                    .as<LayoutMap>()
-                                    .value();
-    }
     if (block->annotations.count(attr::kTileViewMap)) {
       frame.tileview_map = block->annotations.at(attr::kTileViewMap)
                                .as<Map<Var, TileView>>()
@@ -105,13 +97,21 @@ class ValidateCopyTileViewPass : public StmtExprVisitor {
     BufferRegion src = NormalizeToBufferRegion(call->args[arg_base]);
     BufferRegion dst = NormalizeToBufferRegion(call->args[arg_base + 1]);
 
-    ValidateRegionCanFormTileView(src, op_name, "src");
-    ValidateRegionCanFormTileView(dst, op_name, "dst");
-    ValidateTileViewMetadata(src, op_name, "src");
-    ValidateTileViewMetadata(dst, op_name, "dst");
+    Optional<TileView> src_tileview = LookupTileView(src->buffer);
+    Optional<TileView> dst_tileview = LookupTileView(dst->buffer);
+    Optional<TileView> src_validation_tileview =
+        src_tileview.defined() ? src_tileview : dst_tileview;
+    Optional<TileView> dst_validation_tileview =
+        dst_tileview.defined() ? dst_tileview : src_tileview;
+
+    ValidateRegionCanFormTileView(src, src_validation_tileview, op_name, "src");
+    ValidateRegionCanFormTileView(dst, dst_validation_tileview, op_name, "dst");
+    ValidateTileViewMetadata(src, src_tileview, op_name, "src");
+    ValidateTileViewMetadata(dst, dst_tileview, op_name, "dst");
   }
 
   void ValidateRegionCanFormTileView(const BufferRegion &region,
+                                     const Optional<TileView> &maybe_tileview,
                                      const char *op_name,
                                      const char *operand_name) {
     ICHECK(region.defined())
@@ -121,8 +121,13 @@ class ValidateCopyTileViewPass : public StmtExprVisitor {
     ICHECK(!region->region.empty())
         << op_name << " " << operand_name
         << " region must have at least one dimension";
+    ICHECK_EQ(region->region.size(), region->buffer->shape.size())
+        << op_name << " " << operand_name << " region rank "
+        << region->region.size() << " does not match buffer "
+        << region->buffer->name << " rank " << region->buffer->shape.size();
 
-    std::vector<size_t> non_unit_extent_dims;
+    std::unordered_map<size_t, PrimExpr> tile_size_by_dim =
+        BuildTileSizeByDim(region->buffer, maybe_tileview);
     for (size_t dim = 0; dim < region->region.size(); ++dim) {
       const Range &range = region->region[dim];
       ICHECK(range.defined())
@@ -132,24 +137,25 @@ class ValidateCopyTileViewPass : public StmtExprVisitor {
           << op_name << " " << operand_name << " extent at dim " << dim
           << " is undefined for buffer " << region->buffer->name;
 
-      if (!analyzer_.CanProveEqual(range->extent, 1)) {
-        non_unit_extent_dims.push_back(dim);
-      }
+      const PrimExpr &shape = region->buffer->shape[dim];
+      ValidateMinAlignmentToTileSize(range->min, tile_size_by_dim, dim, region,
+                                     op_name, operand_name);
+      ValidateStaticMinIsShapeFactor(range->min, shape, region, dim, op_name,
+                                     operand_name);
+      ValidateExtentIsShapeFactor(range->extent, shape, region, dim, op_name,
+                                  operand_name);
     }
-
-    // TODO(copy-tile-view): after the exact tile alignment rule is finalized,
-    // check region mins/extents against the buffer layout here.  The collected
-    // non-unit extent dims are the candidate tile axes; the final rule should
-    // decide whether to reject ranks other than 1D/2D here or leave them to
-    // non-tile DMA fallback paths.  At this point SunmmioLayoutInference has
-    // attached layout_map/global_layout_map to block annotations, so this pass
-    // has access to both the region and its layout.
-    (void)non_unit_extent_dims;
   }
 
   void ValidateTileViewMetadata(const BufferRegion &region, const char *op_name,
                                 const char *operand_name) {
-    Optional<TileView> maybe_tileview = LookupTileView(region->buffer);
+    ValidateTileViewMetadata(region, LookupTileView(region->buffer), op_name,
+                             operand_name);
+  }
+
+  void ValidateTileViewMetadata(const BufferRegion &region,
+                                const Optional<TileView> &maybe_tileview,
+                                const char *op_name, const char *operand_name) {
     if (!maybe_tileview.defined()) {
       // Explicit TileView metadata is optional for raw copy/dma_copy regions.
       // The backend can construct a tile view directly from region extents.
@@ -158,10 +164,126 @@ class ValidateCopyTileViewPass : public StmtExprVisitor {
 
     TileView tileview = maybe_tileview.value();
     ICHECK(tileview->TileDim() == 1 || tileview->TileDim() == 2)
-        << op_name << " " << operand_name << " buffer "
-        << region->buffer->name
+        << op_name << " " << operand_name << " buffer " << region->buffer->name
         << " has unsupported TileView rank " << tileview->TileDim()
         << "; Sunmmio copy tile views must be 1D or 2D.";
+  }
+
+  std::unordered_map<size_t, PrimExpr>
+  BuildTileSizeByDim(const Buffer &buffer,
+                     const Optional<TileView> &maybe_tileview) {
+    std::unordered_map<size_t, PrimExpr> tile_size_by_dim;
+    if (!maybe_tileview.defined()) {
+      return tile_size_by_dim;
+    }
+
+    TileView tileview = maybe_tileview.value();
+    Array<PrimExpr> tile_shape = tileview->TileShape();
+    Array<PrimExpr> index_map = tileview->IndexMap();
+    ICHECK_EQ(tile_shape.size(), index_map.size())
+        << "TileView for buffer " << buffer->name
+        << " has mismatched tile_shape and index_map ranks";
+
+    int buffer_rank = static_cast<int>(buffer->shape.size());
+    for (size_t tile_axis = 0; tile_axis < index_map.size(); ++tile_axis) {
+      int mapped_dim =
+          NormalizeMappedDim(index_map[tile_axis], buffer_rank, buffer->name);
+      tile_size_by_dim.emplace(static_cast<size_t>(mapped_dim),
+                               tile_shape[tile_axis]);
+    }
+    return tile_size_by_dim;
+  }
+
+  static int NormalizeMappedDim(const PrimExpr &expr, int ndim,
+                                const std::string &buffer_name) {
+    const auto *imm = expr.as<IntImmNode>();
+    ICHECK(imm) << "TileView index_map entries must be IntImm, but got " << expr
+                << " for buffer " << buffer_name;
+    int mapped_dim = static_cast<int>(imm->value);
+    if (mapped_dim < 0) {
+      mapped_dim += ndim;
+    }
+    ICHECK(mapped_dim >= 0 && mapped_dim < ndim)
+        << "TileView index_map entry " << expr
+        << " is out of bounds for buffer " << buffer_name << " with rank "
+        << ndim;
+    return mapped_dim;
+  }
+
+  std::optional<int64_t> TryGetStaticInt(const PrimExpr &expr) {
+    PrimExpr simplified = analyzer_.Simplify(expr);
+    if (const auto *imm = simplified.as<IntImmNode>()) {
+      return imm->value;
+    }
+    return std::nullopt;
+  }
+
+  bool CanProveDivisible(const PrimExpr &value, const PrimExpr &divisor) {
+    PrimExpr simplified_divisor = analyzer_.Simplify(divisor);
+    if (analyzer_.CanProveEqual(simplified_divisor, 0)) {
+      return false;
+    }
+    PrimExpr remainder =
+        analyzer_.Simplify(floormod(value, simplified_divisor));
+    return analyzer_.CanProveEqual(remainder, 0);
+  }
+
+  void ValidateMinAlignmentToTileSize(
+      const PrimExpr &min,
+      const std::unordered_map<size_t, PrimExpr> &tile_size_by_dim, size_t dim,
+      const BufferRegion &region, const char *op_name,
+      const char *operand_name) {
+    auto it = tile_size_by_dim.find(dim);
+    if (it == tile_size_by_dim.end()) {
+      return;
+    }
+
+    const PrimExpr &tile_size = it->second;
+    ICHECK(CanProveDivisible(min, tile_size))
+        << op_name << " " << operand_name << " region min at dim " << dim
+        << " for buffer " << region->buffer->name << " must align to TileView "
+        << "tile size " << tile_size << ", but got min=" << min << ".";
+  }
+
+  void ValidateStaticMinIsShapeFactor(const PrimExpr &min,
+                                      const PrimExpr &shape,
+                                      const BufferRegion &region, size_t dim,
+                                      const char *op_name,
+                                      const char *operand_name) {
+    if (analyzer_.CanProveEqual(min, 0)) {
+      return;
+    }
+
+    std::optional<int64_t> min_value = TryGetStaticInt(min);
+    if (!min_value.has_value()) {
+      return;
+    }
+
+    ICHECK_GT(min_value.value(), 0)
+        << op_name << " " << operand_name << " region min at dim " << dim
+        << " for buffer " << region->buffer->name
+        << " must be non-negative, but got min=" << min << ".";
+    ICHECK(CanProveDivisible(shape, Integer(min_value.value())))
+        << op_name << " " << operand_name << " region min at dim " << dim
+        << " for buffer " << region->buffer->name
+        << " must be zero or a factor of buffer shape " << shape
+        << ", but got min=" << min << ".";
+  }
+
+  void ValidateExtentIsShapeFactor(const PrimExpr &extent,
+                                   const PrimExpr &shape,
+                                   const BufferRegion &region, size_t dim,
+                                   const char *op_name,
+                                   const char *operand_name) {
+    ICHECK(analyzer_.CanProveGreaterEqual(extent, 1))
+        << op_name << " " << operand_name << " region extent at dim " << dim
+        << " for buffer " << region->buffer->name
+        << " must be positive, but got extent=" << extent << ".";
+    ICHECK(CanProveDivisible(shape, extent))
+        << op_name << " " << operand_name << " region extent at dim " << dim
+        << " for buffer " << region->buffer->name
+        << " must be a factor of buffer shape " << shape
+        << ", but got extent=" << extent << ".";
   }
 
   Optional<TileView> LookupTileView(const Buffer &buffer) const {
@@ -190,7 +312,7 @@ class ValidateCopyTileViewPass : public StmtExprVisitor {
   std::vector<ScopeFrame> scope_stack_;
 };
 
-}  // namespace
+} // namespace
 
 tvm::transform::Pass ValidateCopyTileView() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
@@ -205,5 +327,5 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                         ValidateCopyTileView);
 }
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm

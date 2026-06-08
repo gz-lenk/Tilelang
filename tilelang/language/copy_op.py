@@ -12,11 +12,7 @@ from tilelang.utils.language import (
 )
 from tilelang.language.utils import get_extent
 from tilelang.utils.target import target_is_sunmmio
-<<<<<<< HEAD
 from tvm import ir, tir
-=======
-from tvm import tir
->>>>>>> e4472a92 (Add handling for squeeze under mixed regions and add target constraints.)
 from tvm.target import Target
 
 
@@ -91,12 +87,8 @@ def _expr_gt(lhs: tir.PrimExpr, rhs: tir.PrimExpr) -> bool:
     rhs_int = _as_static_int(rhs)
     return lhs_int is not None and rhs_int is not None and lhs_int > rhs_int
 
-<<<<<<< HEAD
 
 # Warn when an explicit BufferRegion exceeds the buffer shape.
-=======
-# 显式 BufferRegion 越界时触发 warning
->>>>>>> e4472a92 (Add handling for squeeze under mixed regions and add target constraints.)
 def _warn_explicit_oob(buffer: tir.Buffer, dim: int, min_value: tir.PrimExpr, extent: tir.PrimExpr, shape: tir.PrimExpr) -> None:
     warnings.warn(
         "T.copy explicit BufferRegion exceeds buffer shape and will be clipped: "
@@ -104,12 +96,8 @@ def _warn_explicit_oob(buffer: tir.Buffer, dim: int, min_value: tir.PrimExpr, ex
         stacklevel=3,
     )
 
-<<<<<<< HEAD
 
 # Clip extents so the region stays within the buffer shape.
-=======
-# 实现range的缩放
->>>>>>> e4472a92 (Add handling for squeeze under mixed regions and add target constraints.)
 def _clip_extent_to_shape(
     buffer: tir.Buffer,
     dim: int,
@@ -359,7 +347,6 @@ def copy(
         src = _encode_normalized_region(src_region, access_type="r")
         dst = _encode_normalized_region(dst_region, access_type="w")
     else:
-<<<<<<< HEAD
         if isinstance(src, tir.Buffer) and isinstance(dst, tir.Buffer):
             ir.assert_structural_equal(src.shape, dst.shape)
         assert src_extent or dst_extent, "Can't deduce copy extents from args"
@@ -368,10 +355,6 @@ def copy(
         src_extent, dst_extent = legalize_pairwise_extents(src_extent, dst_extent)
         src = to_buffer_region(src, access_type="r", extents=src_extent)
         dst = to_buffer_region(dst, access_type="w", extents=dst_extent)
-=======
-        src = to_buffer_region(src, access_type="r", extents=dst_extent)
-        dst = to_buffer_region(dst, access_type="w", extents=src_extent)
->>>>>>> e4472a92 (Add handling for squeeze under mixed regions and add target constraints.)
 
     # Build annotations dict
     ann = annotations.copy() if annotations else {}
