@@ -25,7 +25,10 @@ def disable_tilelang_cache():
 
 
 def _make_copy_kernel(copy_case):
-    if copy_case == "dynamic_extent_warns_and_passes":
+    if copy_case in {
+        "dynamic_extent_warns_and_passes",
+        "dynamic_row_major_inner_mode_warns_and_passes",
+    }:
         shape = (T.dynamic("m"), 96)
         layout = make_row_major(shape)
     elif copy_case.startswith("dynamic_outer_"):
@@ -88,6 +91,51 @@ def _make_copy_kernel(copy_case):
                 A_shared = T.alloc_shared(shape, DTYPE)
                 T.annotate_layout({A: layout, A_shared: layout})
                 T.copy(A[bx * 32 : (bx + 1) * 32, 0:64], A_shared[0:32, 0:64])
+
+    elif copy_case == "row_major_dynamic_min_alignment_unknown":
+        shape = (512, 256)
+        shared_shape = (32, 32)
+        layout = make_row_major(shape)
+        shared_layout = make_row_major(shared_shape)
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(8) as bx:
+                A_shared = T.alloc_shared(shared_shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: shared_layout})
+                ko = (bx + bx) % 8
+                m_offset = bx * 32 + T.min(bx, 1)
+                T.copy(A[m_offset, ko * 32], A_shared)
+
+    elif copy_case == "row_major_dynamic_select_alignment_unknown":
+        shape = (512, 512)
+        shared_shape = (32, 32)
+        layout = make_row_major(shape)
+        shared_layout = make_row_major(shared_shape)
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(4, 4, threads=128) as (bx, by):
+                A_shared = T.alloc_shared(shared_shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: shared_layout})
+                sum_idx = bx + by
+                diff_idx = bx - by
+                scaled_idx = sum_idx * 3 + 1
+                div_idx = scaled_idx // 2
+                mod_idx = div_idx % 7
+                lt_cmp = bx < by + 2
+                le_cmp = by <= bx + 1
+                ne_cmp = bx != by
+                eq_cmp = bx == by
+                not_lt_le = T.Not(lt_cmp and le_cmp)
+                row_cond = (lt_cmp and le_cmp) or (ne_cmp and not_lt_le)
+                row_delta = T.Select(
+                    row_cond,
+                    T.Select(eq_cmp, T.min(mod_idx, 7), T.min(mod_idx + 1, 7)),
+                    T.max(diff_idx, 0),
+                )
+                src_row = by * 64 + 8 + row_delta
+                T.copy(A[src_row, bx * 64], A_shared)
 
     elif copy_case == "zz_block_equal":
 
@@ -197,18 +245,27 @@ def _make_copy_kernel(copy_case):
                 T.annotate_layout({A: layout, A_shared: layout})
                 T.copy(A[0:16, 0:32], A_shared[16:32, 32:64])
 
+    elif copy_case == "dynamic_row_major_inner_mode_warns_and_passes":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
+                T.copy(A[0:32, 0:32], A_shared[0:32, 32:64])
+
     else:
         raise ValueError(f"unknown copy case: {copy_case}")
 
     return tvm.IRModule({"main": kernel})
 
 
-def _run_validate_copy_tile_view(copy_case):
+def _run_validate_tile_view_regions(copy_case):
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     mod = _make_copy_kernel(copy_case)
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
-        return tilelang.transform.ValidateCopyTileView()(mod)
+        return tilelang.transform.ValidateTileViewRegions()(mod)
 
 
 def _make_inferred_layout_copy_kernel(copy_case):
@@ -233,7 +290,7 @@ def _make_inferred_layout_copy_kernel(copy_case):
     return tvm.IRModule({"main": kernel})
 
 
-def _run_kernel_pipeline_to_validate_copy_tile_view(copy_case):
+def _run_kernel_pipeline_to_validate_tile_view_regions(copy_case):
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     mod = _make_inferred_layout_copy_kernel(copy_case)
     with tvm.target.Target(target):
@@ -241,7 +298,158 @@ def _run_kernel_pipeline_to_validate_copy_tile_view(copy_case):
         mod = tilelang.transform.InferSramScope()(mod)
         mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
         mod = tilelang.transform.SunmmioLayoutInference()(mod)
-        return tilelang.transform.ValidateCopyTileView()(mod)
+        return tilelang.transform.ValidateTileViewRegions()(mod)
+
+
+def _make_comm_kernel(comm_case):
+    shape = (96, 96) if comm_case.endswith("_illegal_major_split") else (128, 128)
+    layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
+
+    if comm_case == "broadcast_valid":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                B_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A_shared: layout, B_shared: layout})
+                T.comm.broadcast(
+                    A_shared[0:32, 0:32],
+                    B_shared[32:64, 32:64],
+                    (0, 0),
+                    direction="h",
+                )
+
+    elif comm_case == "broadcast_illegal_major_split":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                B_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A_shared: layout, B_shared: layout})
+                T.comm.broadcast(
+                    A_shared[0:16, 0:32],
+                    B_shared[16:32, 32:64],
+                    (0, 0),
+                    direction="h",
+                )
+
+    elif comm_case == "put_valid":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                B_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A_shared: layout, B_shared: layout})
+                T.comm.put(
+                    A_shared[0:32, 0:32],
+                    B_shared[32:64, 32:64],
+                    (0, 0),
+                    (0, 1),
+                )
+
+    elif comm_case == "allgather_legacy_valid":
+        recv_shape = (16, 32, 32)
+        recv_layout = make_row_major(recv_shape)
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(16) as _bx:
+                A_shared = T.alloc_shared((32, 32), DTYPE)
+                R_shared = T.alloc_shared(recv_shape, DTYPE)
+                T.annotate_layout(
+                    {
+                        A_shared: make_row_major((32, 32)),
+                        R_shared: recv_layout,
+                    }
+                )
+                T.comm.all_gather(A_shared, R_shared, direction="all")
+
+    elif comm_case == "allgather_axis_last_valid":
+        send_shape = (32, 32)
+        recv_shape = (32, 512)
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(16) as _bx:
+                A_shared = T.alloc_shared(send_shape, DTYPE)
+                R_shared = T.alloc_shared(recv_shape, DTYPE)
+                T.annotate_layout(
+                    {
+                        A_shared: make_row_major(send_shape),
+                        R_shared: make_row_major(recv_shape),
+                    }
+                )
+                T.comm.all_gather(A_shared, R_shared, direction="all", axis=-1)
+
+    elif comm_case == "allgather_axis0_illegal_major_split":
+        send_shape = (32, 32)
+        recv_shape = (512, 32)
+        recv_layout = make_zz_layout(recv_shape, axes=[0, 1], block_shape=(32, 32))
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(16) as _bx:
+                A_shared = T.alloc_shared(send_shape, DTYPE)
+                R_shared = T.alloc_shared(recv_shape, DTYPE)
+                T.annotate_layout(
+                    {
+                        A_shared: make_row_major(send_shape),
+                        R_shared: recv_layout,
+                    }
+                )
+                T.comm.all_gather(A_shared, R_shared, direction="all", axis=0)
+
+    elif comm_case == "allreduce_low_level_valid":
+        send_shape = (32, 32)
+        out_shape = (32,)
+        gather_shape = (16, 32)
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(16) as bx:
+                A_shared = T.alloc_shared(send_shape, DTYPE)
+                Out_shared = T.alloc_shared(out_shape, DTYPE)
+                Row_gather = T.alloc_shared(gather_shape, DTYPE)
+                Col_gather = T.alloc_shared(gather_shape, DTYPE)
+                T.annotate_layout(
+                    {
+                        A_shared: make_row_major(send_shape),
+                        Out_shared: make_row_major(out_shape),
+                        Row_gather: make_row_major(gather_shape),
+                        Col_gather: make_row_major(gather_shape),
+                    }
+                )
+                T.evaluate(
+                    tvm.tir.call_intrin(
+                        "handle",
+                        tvm.tir.op.Op.get("tl.tileop.comm_allreduce"),
+                        A_shared[0:32, 0:32],
+                        Out_shared[0:32],
+                        Row_gather[0:16, 0:32],
+                        Col_gather[0:16, 0:32],
+                        "sum",
+                        2,
+                        1,
+                        T.bool(True),
+                        bx,
+                    )
+                )
+
+    else:
+        raise ValueError(f"unknown comm case: {comm_case}")
+
+    return tvm.IRModule({"main": kernel})
+
+
+def _run_comm_validate_tile_view_regions(comm_case):
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    mod = _make_comm_kernel(comm_case)
+    with tvm.target.Target(target):
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        return tilelang.transform.ValidateTileViewRegions()(mod)
 
 
 @pytest.mark.parametrize(
@@ -250,17 +458,20 @@ def _run_kernel_pipeline_to_validate_copy_tile_view(copy_case):
         "row_major_aligned_grid_tile",
         "row_major_1d_tile_view",
         "row_major_dynamic_min_bounds_unknown",
+        "row_major_dynamic_min_alignment_unknown",
+        "row_major_dynamic_select_alignment_unknown",
         "zz_block_equal",
         "zz_block_non_major_dim_split",
         "zz_block_non_major_dim_multi_block",
         "zn_block_non_major_dim_split",
         "zz_whole_dim",
         "dynamic_extent_warns_and_passes",
+        "dynamic_row_major_inner_mode_warns_and_passes",
         "dynamic_outer_static_extent_equal_block",
     ],
 )
-def test_sunmmio_validate_copy_tile_view_accepts_legal_regions(copy_case):
-    _run_validate_copy_tile_view(copy_case)
+def test_sunmmio_validate_tile_view_regions_accepts_legal_regions(copy_case):
+    _run_validate_tile_view_regions(copy_case)
 
 
 @pytest.mark.parametrize(
@@ -296,13 +507,13 @@ def test_sunmmio_validate_copy_tile_view_accepts_legal_regions(copy_case):
         ),
     ],
 )
-def test_sunmmio_validate_copy_tile_view_rejects_illegal_regions(copy_case, error_msg):
+def test_sunmmio_validate_tile_view_regions_rejects_illegal_regions(copy_case, error_msg):
     with pytest.raises(tvm.error.InternalError, match=error_msg):
-        _run_validate_copy_tile_view(copy_case)
+        _run_validate_tile_view_regions(copy_case)
 
 
-def test_sunmmio_validate_copy_tile_view_accepts_kernel_after_layout_inference():
-    _run_kernel_pipeline_to_validate_copy_tile_view("zz_block_equal")
+def test_sunmmio_validate_tile_view_regions_accepts_kernel_after_layout_inference():
+    _run_kernel_pipeline_to_validate_tile_view_regions("zz_block_equal")
 
 
 @pytest.mark.parametrize(
@@ -318,9 +529,41 @@ def test_sunmmio_validate_copy_tile_view_accepts_kernel_after_layout_inference()
         ),
     ],
 )
-def test_sunmmio_validate_copy_tile_view_rejects_kernel_after_layout_inference(copy_case, error_msg):
+def test_sunmmio_validate_tile_view_regions_rejects_kernel_after_layout_inference(copy_case, error_msg):
     with pytest.raises(tvm.error.InternalError, match=error_msg):
-        _run_kernel_pipeline_to_validate_copy_tile_view(copy_case)
+        _run_kernel_pipeline_to_validate_tile_view_regions(copy_case)
+
+
+@pytest.mark.parametrize(
+    "comm_case",
+    [
+        "broadcast_valid",
+        "put_valid",
+        "allgather_legacy_valid",
+        "allgather_axis_last_valid",
+        "allreduce_low_level_valid",
+    ],
+)
+def test_sunmmio_validate_tile_view_regions_accepts_comm_regions(comm_case):
+    _run_comm_validate_tile_view_regions(comm_case)
+
+
+@pytest.mark.parametrize(
+    "comm_case, error_msg",
+    [
+        (
+            "broadcast_illegal_major_split",
+            "must be on the non-major dimension",
+        ),
+        (
+            "allgather_axis0_illegal_major_split",
+            "must be on the non-major dimension",
+        ),
+    ],
+)
+def test_sunmmio_validate_tile_view_regions_rejects_comm_regions(comm_case, error_msg):
+    with pytest.raises(tvm.error.InternalError, match=error_msg):
+        _run_comm_validate_tile_view_regions(comm_case)
 
 
 if __name__ == "__main__":

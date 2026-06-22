@@ -183,8 +183,8 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.SunmmioLayoutInference()(mod)
         # Legalize Sunmmio Bf16 Gemm
         mod = tilelang.transform.LegalizeSunmmioGemm()(mod)
-        # Validate Sunmmio copy regions while tile-view metadata is still available.
-        mod = tilelang.transform.ValidateCopyTileView()(mod)
+        # Validate Sunmmio tile-view regions while layout metadata is still available.
+        mod = tilelang.transform.ValidateTileViewRegions()(mod)
     else:
         # Infer memory layouts — target-conditional
         mod = tilelang.transform.LayoutReducer()(mod)

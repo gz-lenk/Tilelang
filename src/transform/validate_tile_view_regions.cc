@@ -1,7 +1,6 @@
 /*!
- * \file validate_copy_tile_view.cc
- * \brief Validate copy regions that must be representable as Sunmmio tile
- * views.
+ * \file validate_tile_view_regions.cc
+ * \brief Validate regions that must be representable as Sunmmio tile views.
  */
 
 #include <tvm/arith/analyzer.h>
@@ -21,9 +20,11 @@
 #include "../layout/cute_layout.h"
 #include "../layout/layout.h"
 #include "../op/builtin.h"
+#include "../op/comm.h"
 #include "../op/copy.h"
 #include "../op/operator.h"
 #include "../op/utils.h"
+#include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "common/attr.h"
 
@@ -35,7 +36,7 @@ using namespace tir::transform;
 
 namespace {
 
-class ValidateCopyTileViewPass : public StmtExprVisitor {
+class ValidateTileViewRegionsPass : public StmtExprVisitor {
 public:
   static PrimFunc Run(PrimFunc f) {
     auto target = f->GetAttr<Target>(tvm::attr::kTarget);
@@ -43,7 +44,8 @@ public:
       return f;
     }
 
-    ValidateCopyTileViewPass validator;
+    ValidateTileViewRegionsPass validator;
+    validator.target_ = target.value();
     validator.VisitStmt(f->body);
     return f;
   }
@@ -63,6 +65,12 @@ private:
     LayoutMap global_layout_map;
   };
 
+  enum class DivisibilityProof {
+    kDivisible,
+    kNotDivisible,
+    kUnknown,
+  };
+
   void VisitStmt_(const BlockNode *op) final {
     PushScope(op);
     StmtExprVisitor::VisitStmt_(op);
@@ -71,9 +79,17 @@ private:
 
   void VisitExpr_(const CallNode *op) final {
     if (IsCopyTileOp(op)) {
-      ValidateCopyCall(op, "tl.tileop.copy", /*arg_base=*/0);
+      ValidateTwoRegionOp(op, "tl.tileop.copy", /*arg_base=*/0);
     } else if (IsDmaCopyOp(op)) {
-      ValidateCopyCall(op, "tl.dma_copy", /*arg_base=*/0);
+      ValidateTwoRegionOp(op, "tl.dma_copy", /*arg_base=*/0);
+    } else if (IsCommBroadcastOp(op)) {
+      ValidateTwoRegionOp(op, "tl.tileop.comm_broadcast", /*arg_base=*/0);
+    } else if (IsCommPutOp(op)) {
+      ValidateTwoRegionOp(op, "tl.tileop.comm_put", /*arg_base=*/0);
+    } else if (IsCommAllgatherOp(op)) {
+      ValidateAllgatherOp(op);
+    } else if (IsCommAllreduceOp(op)) {
+      ValidateAllreduceOp(op);
     }
     StmtExprVisitor::VisitExpr_(op);
   }
@@ -84,6 +100,22 @@ private:
 
   static bool IsDmaCopyOp(const CallNode *call) {
     return call->op.same_as(dma_copy());
+  }
+
+  static bool IsCommBroadcastOp(const CallNode *call) {
+    return call->op.same_as(BroadcastOp::Get());
+  }
+
+  static bool IsCommPutOp(const CallNode *call) {
+    return call->op.same_as(PutOp::Get());
+  }
+
+  static bool IsCommAllgatherOp(const CallNode *call) {
+    return call->op.same_as(AllgatherOp::Get());
+  }
+
+  static bool IsCommAllreduceOp(const CallNode *call) {
+    return call->op.same_as(AllreduceOp::Get());
   }
 
   void PushScope(const BlockNode *block) {
@@ -155,8 +187,8 @@ private:
     buffers->push_back(buffer);
   }
 
-  void ValidateCopyCall(const CallNode *call, const char *op_name,
-                        size_t arg_base) {
+  void ValidateTwoRegionOp(const CallNode *call, const char *op_name,
+                           size_t arg_base) {
     ICHECK_GE(call->args.size(), arg_base + 2)
         << op_name << " expects at least src and dst region arguments";
 
@@ -165,6 +197,162 @@ private:
 
     ValidateRegionCanFormTileView(src, op_name, "src");
     ValidateRegionCanFormTileView(dst, op_name, "dst");
+  }
+
+  void ValidateAllgatherOp(const CallNode *call) {
+    ICHECK_GE(call->args.size(), 4U)
+        << "tl.tileop.comm_allgather expects at least send, recv, direction, "
+           "and size";
+
+    const auto *direction_imm = call->args[2].as<IntImmNode>();
+    ICHECK(direction_imm)
+        << "tl.tileop.comm_allgather direction must be IntImm";
+    int64_t direction = direction_imm->value;
+    ICHECK(direction == 0 || direction == 1 || direction == 2)
+        << "Invalid direction value for tl.tileop.comm_allgather: "
+        << direction;
+
+    int64_t axis = -1;
+    if (call->args.size() > 4) {
+      const auto *axis_imm = call->args[4].as<IntImmNode>();
+      ICHECK(axis_imm) << "tl.tileop.comm_allgather axis must be IntImm";
+      axis = axis_imm->value;
+    }
+
+    ValidateAllgatherRegions(NormalizeToBufferRegion(call->args[0]),
+                             NormalizeToBufferRegion(call->args[1]), direction,
+                             axis, "tl.tileop.comm_allgather");
+  }
+
+  void ValidateAllreduceOp(const CallNode *call) {
+    ICHECK(call->args.size() == 9 || call->args.size() == 10)
+        << "tl.tileop.comm_allreduce expects 9 or 10 inputs, got "
+        << call->args.size();
+
+    BufferRegion src = NormalizeToBufferRegion(call->args[0]);
+    BufferRegion dst = NormalizeToBufferRegion(call->args[1]);
+    BufferRegion row_allgather = NormalizeToBufferRegion(call->args[2]);
+    BufferRegion col_allgather = NormalizeToBufferRegion(call->args[3]);
+
+    const auto *direction_imm = call->args[5].as<IntImmNode>();
+    ICHECK(direction_imm)
+        << "tl.tileop.comm_allreduce direction must be IntImm";
+    int64_t direction = direction_imm->value;
+    ICHECK(direction == 0 || direction == 1 || direction == 2)
+        << "Invalid direction value for tl.tileop.comm_allreduce: "
+        << direction;
+
+    const auto *clear_imm = call->args[7].as<IntImmNode>();
+    ICHECK(clear_imm) << "tl.tileop.comm_allreduce clear must be IntImm";
+    bool should_clear = clear_imm->value != 0;
+
+    ValidateRegionCanFormTileView(src, "tl.tileop.comm_allreduce", "src");
+    ValidateRegionCanFormTileView(dst, "tl.tileop.comm_allreduce", "dst");
+
+    BufferRegion gather_send = dst;
+    if (!should_clear) {
+      ICHECK_EQ(call->args.size(), 10U)
+          << "tl.tileop.comm_allreduce clear=false requires dst_copy";
+      BufferRegion dst_copy = NormalizeToBufferRegion(call->args[8]);
+      ValidateRegionCanFormTileView(dst_copy, "tl.tileop.comm_allreduce",
+                                    "dst_copy");
+      gather_send = dst_copy;
+    }
+
+    if (direction == 0 || direction == 2) {
+      ValidateAllgatherRegions(gather_send, row_allgather, /*direction=*/0,
+                               /*axis=*/-1, "tl.tileop.comm_allreduce.row");
+    }
+    if (direction == 1 || direction == 2) {
+      ValidateAllgatherRegions(gather_send, col_allgather, /*direction=*/1,
+                               /*axis=*/-1, "tl.tileop.comm_allreduce.col");
+    }
+  }
+
+  void ValidateAllgatherRegions(const BufferRegion &send,
+                                const BufferRegion &recv, int64_t direction,
+                                int64_t axis, const char *op_name) {
+    ValidateRegionCanFormTileView(send, op_name, "send");
+
+    auto mesh = GetSunmmioMeshConfig(target_.value());
+    int64_t recv_num = 1;
+    if (direction == 0) {
+      recv_num = mesh.ncol;
+    } else if (direction == 1) {
+      recv_num = mesh.nrow;
+    } else {
+      recv_num = mesh.nrow * mesh.ncol;
+    }
+
+    int recv_rank = static_cast<int>(recv->region.size());
+    ICHECK_GT(recv_rank, 0) << op_name << " recv must have at least one dim.";
+    if (axis > 0) {
+      ICHECK_EQ(axis, static_cast<int64_t>(send->region.size()) - 1)
+          << "Only axis = last dim of send is supported; got axis=" << axis
+          << " for send rank=" << send->region.size();
+      ICHECK_EQ(recv->region.size(), send->region.size())
+          << "In axis mode, recv and send must have the same rank.";
+    }
+
+    int slice_axis = (axis > 0) ? (recv_rank - 1) : 0;
+    PrimExpr recv_num_expr = IntImm(DataType::Int(32), recv_num);
+    ICHECK(CanProveDivisible(recv->region[slice_axis]->extent, recv_num_expr))
+        << op_name << " recv extent along slice axis " << slice_axis << " ("
+        << recv->region[slice_axis]->extent
+        << ") must be divisible by recv_num (" << recv_num << ").";
+    PrimExpr slot_extent = analyzer_.Simplify(
+        floordiv(recv->region[slice_axis]->extent, recv_num_expr));
+
+    auto make_slab = [&](PrimExpr slot_start, PrimExpr extent) {
+      Array<Range> ranges;
+      for (int dim = 0; dim < recv_rank; ++dim) {
+        if (dim == slice_axis) {
+          PrimExpr base =
+              analyzer_.Simplify(recv->region[dim]->min + slot_start * extent);
+          ranges.push_back(Range::FromMinExtent(base, extent));
+        } else {
+          ranges.push_back(recv->region[dim]);
+        }
+      }
+      return BufferRegion(recv->buffer, ranges);
+    };
+
+    bool legacy_new_axis =
+        axis < 0 && recv->region.size() == send->region.size() + 1;
+    ValidateAllgatherRecvSlab(
+        make_slab(make_zero(slot_extent.dtype()), slot_extent), op_name,
+        "recv_slab", legacy_new_axis ? slice_axis : -1);
+    if (direction == 2) {
+      PrimExpr row_extent = analyzer_.Simplify(
+          IntImm(DataType::Int(32), mesh.ncol) * slot_extent);
+      ValidateAllgatherRecvSlab(
+          make_slab(make_zero(row_extent.dtype()), row_extent), op_name,
+          "recv_row_slab", legacy_new_axis ? slice_axis : -1);
+    }
+  }
+
+  void ValidateAllgatherRecvSlab(const BufferRegion &region,
+                                 const char *op_name, const char *operand_name,
+                                 int legacy_gather_axis) {
+    if (legacy_gather_axis < 0 ||
+        (region->region[legacy_gather_axis]->extent.as<IntImmNode>() &&
+         region->region[legacy_gather_axis]->extent.as<IntImmNode>()->value ==
+             1)) {
+      ValidateRegionCanFormTileView(region, op_name, operand_name);
+      return;
+    }
+
+    Array<Range> tile_ranges;
+    for (int dim = 0; dim < static_cast<int>(region->region.size()); ++dim) {
+      const Range &range = region->region[dim];
+      if (dim == legacy_gather_axis) {
+        tile_ranges.push_back(Range::FromMinExtent(range->min, 1));
+      } else {
+        tile_ranges.push_back(range);
+      }
+    }
+    ValidateRegionCanFormTileView(BufferRegion(region->buffer, tile_ranges),
+                                  op_name, operand_name);
   }
 
   void ValidateRegionCanFormTileView(const BufferRegion &region,
@@ -216,13 +404,24 @@ private:
   }
 
   bool CanProveDivisible(const PrimExpr &value, const PrimExpr &divisor) {
+    return ProveDivisibility(value, divisor) == DivisibilityProof::kDivisible;
+  }
+
+  DivisibilityProof ProveDivisibility(const PrimExpr &value,
+                                      const PrimExpr &divisor) {
     PrimExpr simplified_divisor = analyzer_.Simplify(divisor);
     if (analyzer_.CanProveEqual(simplified_divisor, 0)) {
-      return false;
+      return DivisibilityProof::kNotDivisible;
     }
     PrimExpr remainder =
         analyzer_.Simplify(floormod(value, simplified_divisor));
-    return analyzer_.CanProveEqual(remainder, 0);
+    if (analyzer_.CanProveEqual(remainder, 0)) {
+      return DivisibilityProof::kDivisible;
+    }
+    if (analyzer_.CanProve(remainder != make_zero(remainder.dtype()))) {
+      return DivisibilityProof::kNotDivisible;
+    }
+    return DivisibilityProof::kUnknown;
   }
 
   void ValidateTiledDim(const BufferRegion &region, const Layout &layout,
@@ -235,26 +434,33 @@ private:
 
     std::optional<int64_t> static_extent = TryGetStaticInt(region_extent);
     if (!static_extent.has_value() || static_extent.value() <= 0) {
-      LOG(WARNING) << op_name << " " << operand_name
-                   << " region extent at dim " << dim << " for buffer "
-                   << region->buffer->name
+      LOG(WARNING) << op_name << " " << operand_name << " region extent at dim "
+                   << dim << " for buffer " << region->buffer->name
                    << " is not a positive compile-time constant; skip "
                       "tile_view validation for this dimension. extent="
                    << region_extent << ".";
       return;
     }
 
-    DimLayoutInfo info = GetDimLayoutInfo(layout, dim, region->buffer);
-
     ICHECK(!analyzer_.CanProve(region_min < make_zero(region_min.dtype())))
         << op_name << " " << operand_name << " region min at dim " << dim
         << " for buffer " << region->buffer->name
         << " must be non-negative, but got min=" << region_min << ".";
-    ICHECK(CanProveDivisible(region_min, region_extent))
+    DivisibilityProof min_alignment =
+        ProveDivisibility(region_min, region_extent);
+    ICHECK(min_alignment != DivisibilityProof::kNotDivisible)
         << op_name << " " << operand_name << " region min at dim " << dim
         << " for buffer " << region->buffer->name
         << " must align to region extent " << region_extent
         << ", but got min=" << region_min << ".";
+    if (min_alignment == DivisibilityProof::kUnknown) {
+      LOG(WARNING) << op_name << " " << operand_name << " region min at dim "
+                   << dim << " for buffer " << region->buffer->name
+                   << " cannot be proven aligned to region extent "
+                   << region_extent
+                   << "; skip alignment validation for this dimension. min="
+                   << region_min << ".";
+    }
     PrimExpr region_end = analyzer_.Simplify(region_min + region_extent);
     ICHECK(!analyzer_.CanProve(region_end > buffer_shape))
         << op_name << " " << operand_name << " region at dim " << dim
@@ -263,12 +469,17 @@ private:
         << ", but got min=" << region_min << " and extent=" << region_extent
         << ".";
     if (!analyzer_.CanProve(region_end <= buffer_shape)) {
-      LOG(WARNING) << op_name << " " << operand_name << " region at dim "
-                   << dim << " for buffer " << region->buffer->name
+      LOG(WARNING) << op_name << " " << operand_name << " region at dim " << dim
+                   << " for buffer " << region->buffer->name
                    << " cannot be proven within buffer shape " << buffer_shape
                    << "; skip bounds validation for this dimension. min="
                    << region_min << ", extent=" << region_extent
                    << ", end=" << region_end << ".";
+    }
+
+    DimLayoutInfo info = GetDimLayoutInfo(layout, dim, region->buffer);
+    if (!info.has_layout) {
+      return;
     }
 
     if (info.has_dynamic_outer_mode) {
@@ -281,11 +492,22 @@ private:
       return;
     }
 
-    ICHECK(CanProveDivisible(buffer_shape, region_extent))
+    DivisibilityProof shape_divisibility =
+        ProveDivisibility(buffer_shape, region_extent);
+    ICHECK(shape_divisibility != DivisibilityProof::kNotDivisible)
         << op_name << " " << operand_name << " region extent at dim " << dim
         << " for buffer " << region->buffer->name
         << " must divide buffer shape " << buffer_shape
         << ", but got extent=" << region_extent << ".";
+    if (shape_divisibility == DivisibilityProof::kUnknown) {
+      LOG(WARNING) << op_name << " " << operand_name << " region extent at dim "
+                   << dim << " for buffer " << region->buffer->name
+                   << " cannot be proven to divide buffer shape "
+                   << buffer_shape
+                   << "; skip buffer-shape divisibility validation for this "
+                      "dimension. extent="
+                   << region_extent << ".";
+    }
 
     if (info.is_blockwise) {
       const bool splits_coalesced_block =
@@ -304,8 +526,8 @@ private:
         ICHECK(info.is_blockwise_non_major_dim)
             << op_name << " " << operand_name
             << " blockwise region extent at dim " << dim << " for buffer "
-            << region->buffer->name
-            << " splits coalesced extent " << info.coalesced_extent
+            << region->buffer->name << " splits coalesced extent "
+            << info.coalesced_extent
             << " and must be on the non-major dimension, but got extent="
             << region_extent << ".";
       }
@@ -346,16 +568,26 @@ private:
                                    << buffer->name << " dim " << dim << ".";
 
       const auto *inner_shape = mode_shapes[0].as<IntImmNode>();
-      ICHECK(inner_shape) << "CuteLayout inner mode shape for buffer "
-                          << buffer->name << " dim " << dim
-                          << " must be static, but got " << mode_shapes[0]
-                          << ".";
+      if (!inner_shape) {
+        LOG(WARNING) << "CuteLayout inner mode shape for buffer "
+                     << buffer->name << " dim " << dim
+                     << " is not a compile-time constant; skip tile_view "
+                        "layout validation for this dimension. shape="
+                     << mode_shapes[0] << ".";
+        info.has_layout = false;
+        return info;
+      }
       info.inner_static_mode_shape = inner_shape->value;
 
       info.is_blockwise = mode_shapes.size() > 1;
       if (info.is_blockwise) {
-        info.is_blockwise_non_major_dim =
-            IsBlockwiseNonMajorDim(cute, static_cast<int>(dim), buffer);
+        std::optional<bool> non_major =
+            TryGetBlockwiseNonMajorDim(cute, static_cast<int>(dim), buffer);
+        if (!non_major.has_value()) {
+          info.has_layout = false;
+          return info;
+        }
+        info.is_blockwise_non_major_dim = non_major.value();
       }
 
       const bool outer_dynamic =
@@ -368,17 +600,26 @@ private:
     }
 
     std::optional<int64_t> shape_value = TryGetStaticInt(buffer->shape[dim]);
-    ICHECK(shape_value.has_value() && shape_value.value() > 0)
+    if (!shape_value.has_value()) {
+      LOG(WARNING) << "Non-CuteLayout buffer " << buffer->name << " dim " << dim
+                   << " has non-static buffer.shape; skip tile_view layout "
+                      "validation for this dimension. shape="
+                   << buffer->shape[dim] << ".";
+      info.has_layout = false;
+      return info;
+    }
+    ICHECK_GT(shape_value.value(), 0)
         << "Non-CuteLayout buffer " << buffer->name << " dim " << dim
-        << " requires static positive buffer.shape, but got "
-        << buffer->shape[dim] << ".";
+        << " requires positive buffer.shape, but got " << buffer->shape[dim]
+        << ".";
     info.coalesced_extent = shape_value.value();
     info.inner_static_mode_shape = shape_value.value();
     return info;
   }
 
-  bool IsBlockwiseNonMajorDim(const CuteLayoutNode *layout, int dim,
-                              const Buffer &buffer) {
+  std::optional<bool> TryGetBlockwiseNonMajorDim(const CuteLayoutNode *layout,
+                                                 int dim,
+                                                 const Buffer &buffer) {
     auto dim_levels = layout->GetDimLevels();
     int64_t min_innermost_stride = std::numeric_limits<int64_t>::max();
     std::optional<int64_t> dim_innermost_stride;
@@ -396,11 +637,14 @@ private:
           << "Blockwise CuteLayout has no strides for buffer " << buffer->name
           << " dim " << candidate_dim << ".";
       std::optional<int64_t> stride = TryGetStaticInt(strides[0]);
-      ICHECK(stride.has_value())
-          << "Blockwise CuteLayout innermost stride for buffer " << buffer->name
-          << " dim " << candidate_dim
-          << " must be a compile-time constant, but got " << strides[0]
-          << ".";
+      if (!stride.has_value()) {
+        LOG(WARNING) << "Blockwise CuteLayout innermost stride for buffer "
+                     << buffer->name << " dim " << candidate_dim
+                     << " is not a compile-time constant; skip tile_view "
+                        "layout validation for this dimension. stride="
+                     << strides[0] << ".";
+        return std::nullopt;
+      }
       min_innermost_stride = std::min(min_innermost_stride, stride.value());
       if (static_cast<int>(candidate_dim) == dim) {
         dim_innermost_stride = stride;
@@ -481,21 +725,22 @@ private:
 
   arith::Analyzer analyzer_;
   std::vector<ScopeFrame> scope_stack_;
+  std::optional<Target> target_;
 };
 
 } // namespace
 
-tvm::transform::Pass ValidateCopyTileView() {
+tvm::transform::Pass ValidateTileViewRegions() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
-    return ValidateCopyTileViewPass::Run(std::move(f));
+    return ValidateTileViewRegionsPass::Run(std::move(f));
   };
-  return CreatePrimFuncPass(pass_func, 0, "tl.ValidateCopyTileView", {});
+  return CreatePrimFuncPass(pass_func, 0, "tl.ValidateTileViewRegions", {});
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.transform.ValidateCopyTileView",
-                        ValidateCopyTileView);
+  refl::GlobalDef().def("tl.transform.ValidateTileViewRegions",
+                        ValidateTileViewRegions);
 }
 
 } // namespace tl

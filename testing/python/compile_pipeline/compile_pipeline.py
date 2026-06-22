@@ -290,8 +290,8 @@ def LowerAndLegalize_sunmmio_test(
     mod = tilelang.transform.SunmmioLayoutInference()(mod)
     pass_output_process(mod, "SunmmioLayoutInference", test_config)
 
-    mod = tilelang.transform.ValidateCopyTileView()(mod)
-    pass_output_process(mod, "ValidateCopyTileView", test_config)
+    mod = tilelang.transform.ValidateTileViewRegions()(mod)
+    pass_output_process(mod, "ValidateTileViewRegions", test_config)
 
     LayoutVisual(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
