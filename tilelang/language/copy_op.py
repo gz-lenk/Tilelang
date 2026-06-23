@@ -38,7 +38,9 @@ class _NormalizedCopyRegion:
 
 def _resolve_let_value(obj: Any) -> Any:
     from tilelang.language.frame import has_let_value, get_let_value
+    from tilelang.language.mesh_tensor import unwrap_mesh_tensor
 
+    obj = unwrap_mesh_tensor(obj)
     if isinstance(obj, tir.Var) and has_let_value(obj):
         return get_let_value(obj)
     return obj
